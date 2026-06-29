@@ -48,7 +48,7 @@ This repo already contains `Dockerfile` (and a `.dockerignore`).
 ## 4. Build the image
 
 ```powershell
-docker build -t hunyuan3d-2 .
+docker build -t hunyuan3d-2 /d/Hunyuan3D-2
 ```
 
 ---
@@ -56,12 +56,13 @@ docker build -t hunyuan3d-2 .
 ## 5. Run Hunyuan3D-2 with GPU
 
 ```powershell
-docker run --gpus all -it --rm `
-  -p 7860:7860 `
-  --ipc=host `
-  -v D:\AI\Hunyuan3D-2\outputs:/workspace/outputs `
-  -v D:\AI\Hunyuan3D-2\cache:/workspace/cache `
-  --name hunyuan3d `
+MSYS_NO_PATHCONV=1 docker run --gpus all -it --rm \
+  -p 7860:7860 \
+  --ipc=host \
+  --env-file "D:/Hunyuan3D-2/.env" \
+  -v /d/Hunyuan3D-2/outputs:/workspace/outputs \
+  -v /d/Hunyuan3D-2/cache:/workspace/cache \
+  --name hunyuan3d-2 \
   hunyuan3d-2
 ```
 
@@ -159,4 +160,6 @@ LODs
 ```
 
 Best starting setup: **GLB from Hunyuan3D-2, Blender cleanup, FBX into Unreal**.
+
+
 

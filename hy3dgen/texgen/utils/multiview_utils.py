@@ -31,9 +31,14 @@ class Multiview_Diffusion_Net():
         current_file_path = os.path.abspath(__file__)
         custom_pipeline_path = os.path.join(os.path.dirname(current_file_path), '..', 'hunyuanpaint')
 
+        # diffusers requires explicit opt-in to execute custom pipeline code (even if it is local)
+        # when `custom_pipeline` is used.
         pipeline = DiffusionPipeline.from_pretrained(
             multiview_ckpt_path,
-            custom_pipeline=custom_pipeline_path, torch_dtype=torch.float16)
+            custom_pipeline=custom_pipeline_path,
+            trust_remote_code=True,
+            torch_dtype=torch.float16,
+        )
 
         if config.pipe_name in ['hunyuanpaint']:
             pipeline.scheduler = EulerAncestralDiscreteScheduler.from_config(pipeline.scheduler.config,

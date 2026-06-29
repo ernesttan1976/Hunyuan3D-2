@@ -44,8 +44,11 @@ RUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r req
 RUN python -m pip install --no-cache-dir -e .
 
 # Build required native extensions (CUDA + pybind11)
-RUN python -m pip install --no-cache-dir ./hy3dgen/texgen/differentiable_renderer
-RUN python -m pip install --no-cache-dir ./hy3dgen/texgen/custom_rasterizer
+# These extension setup.py files import build-time deps (pybind11/torch) at import time.
+# With PEP517, pip may build in an isolated env that doesn't have those deps installed yet.
+RUN python -m pip install --no-cache-dir pybind11
+RUN python -m pip install --no-cache-dir --no-build-isolation ./hy3dgen/texgen/differentiable_renderer
+RUN python -m pip install --no-cache-dir --no-build-isolation ./hy3dgen/texgen/custom_rasterizer
 
 EXPOSE 7860
 
