@@ -22,11 +22,39 @@ from diffusers import DiffusionPipeline
 from diffusers import EulerAncestralDiscreteScheduler, LCMScheduler
 
 
+def _torch_version_lt_2_6() -> bool:
+    # torch.__version__ can look like: "2.5.1+cu121" / "2.6.0" / "2.6.0a0+git..."
+    import re
+
+    m = re.match(r"^(\d+)\.(\d+)", str(torch.__version__))
+    if not m:
+        return False
+    major, minor = int(m.group(1)), int(m.group(2))
+    return (major, minor) < (2, 6)
+
+
+def _transformers_has_safe_torch_load_guard() -> bool:
+    # Newer transformers blocks torch.load for torch<2.6 for security reasons.
+    try:
+        from transformers.utils.import_utils import check_torch_load_is_safe  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
 class Multiview_Diffusion_Net():
     def __init__(self, config) -> None:
         self.device = config.device
         self.view_size = 512
         multiview_ckpt_path = config.multiview_ckpt_path
+
+        if _transformers_has_safe_torch_load_guard() and _torch_version_lt_2_6():
+            raise RuntimeError(
+                "Your torch version is too old to load Hunyuan3D-2 texture checkpoints with recent transformers. "
+                f"Found torch=={torch.__version__}. Please upgrade to torch>=2.6 (recommended), "
+                "or use safetensors weights (the released VAE weights are .bin) / downgrade transformers."
+            )
 
         current_file_path = os.path.abspath(__file__)
         custom_pipeline_path = os.path.join(os.path.dirname(current_file_path), '..', 'hunyuanpaint')
@@ -37,6 +65,9 @@ class Multiview_Diffusion_Net():
             multiview_ckpt_path,
             custom_pipeline=custom_pipeline_path,
             trust_remote_code=True,
+            # The released VAE weights for Hunyuan3D-Paint are `.bin` (no safetensors), so
+            # explicitly skip the safetensors lookup to avoid confusing "missing .safetensors" logs.
+            use_safetensors=False,
             torch_dtype=torch.float16,
         )
 

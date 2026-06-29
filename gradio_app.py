@@ -658,7 +658,54 @@ if __name__ == '__main__':
     parser.add_argument('--enable_flashvdm', action='store_true')
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
+    parser.add_argument(
+        '--max_vram_gb',
+        type=float,
+        default=None,
+        help='Best-effort VRAM cap (CUDA only). You can also set HY3D_MAX_VRAM_GB.',
+    )
     args = parser.parse_args()
+
+    if args.max_vram_gb is None:
+        _env_max_vram = os.getenv('HY3D_MAX_VRAM_GB')
+        if _env_max_vram:
+            try:
+                args.max_vram_gb = float(_env_max_vram)
+            except ValueError:
+                print(f"Invalid HY3D_MAX_VRAM_GB={_env_max_vram!r}; ignoring.")
+
+    def _apply_cuda_vram_cap(max_vram_gb: float | None, device_str: str) -> None:
+        # Docker/NVIDIA doesn't provide a strict VRAM limit; this is a best-effort cap
+        # for PyTorch's caching allocator.
+        if not max_vram_gb or max_vram_gb <= 0:
+            return
+        if not isinstance(device_str, str) or not device_str.startswith('cuda'):
+            return
+        if not torch.cuda.is_available():
+            return
+
+        device_index = 0
+        if ':' in device_str:
+            try:
+                device_index = int(device_str.split(':', 1)[1])
+            except ValueError:
+                device_index = 0
+
+        try:
+            props = torch.cuda.get_device_properties(device_index)
+            total_gb = props.total_memory / (1024 ** 3)
+            frac = max_vram_gb / max(total_gb, 1e-6)
+            # Keep inside valid range; very tiny fractions tend to break quickly.
+            frac = max(0.01, min(1.0, frac))
+            torch.cuda.set_per_process_memory_fraction(frac, device=device_index)
+            print(
+                f"[VRAM cap] device=cuda:{device_index} total={total_gb:.2f}GB "
+                f"cap={max_vram_gb:.2f}GB fraction={frac:.4f}"
+            )
+        except Exception as e:
+            print(f"Failed to apply VRAM cap ({max_vram_gb} GB): {e}")
+
+    _apply_cuda_vram_cap(args.max_vram_gb, args.device)
 
     SAVE_DIR = args.cache_path
     os.makedirs(SAVE_DIR, exist_ok=True)

@@ -172,7 +172,11 @@ Hunyuan3D 2.0 supports Macos, Windows, Linux. You may follow the next steps to u
 
 ### Install Requirements
 
-Please install Pytorch via the [official](https://pytorch.org/) site. Then install the other requirements via
+Please install Pytorch via the [official](https://pytorch.org/) site.
+
+Note: If you see an error like `we now require users to upgrade torch to at least v2.6` while loading the texture
+generator, upgrade to `torch>=2.6` (recent `transformers` blocks loading pickled `.bin` weights for security reasons).
+Then install the other requirements via
 
 ```bash
 pip install -r requirements.txt

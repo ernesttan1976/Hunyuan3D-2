@@ -5,9 +5,11 @@ diffusers
 einops
 opencv-python
 numpy
-torch
+# NOTE: Recent `transformers` blocks loading pickled `.bin` weights unless torch>=2.6
+# (see CVE-2025-32434). Hunyuan3D-2 texture checkpoints include `.bin` weights.
+torch>=2.6.0
 transformers
-torchvision
+torchvision>=0.21.0
 #taming-transformers-rom1504
 #ConfigArgParse
 #ipdb
