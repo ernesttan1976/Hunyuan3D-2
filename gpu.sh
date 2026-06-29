@@ -34,31 +34,58 @@ done
 need nvidia-smi
 
 list_apps_raw() {
-  # Prefer both compute + graphics if available. Some driver modes only support one.
+  # nvidia-smi structured outputs (Linux/TCC and compute contexts).
   (nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
   (nvidia-smi --query-graphics-apps=pid,process_name,used_memory --format=csv,noheader,nounits 2>/dev/null || true)
 }
 
 list_apps() {
   # Output: pid<TAB>name<TAB>mib
-  list_apps_raw \
-    | awk -F',' '{
-        for (i=1;i<=NF;i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i) }
-        pid=$1; name=$2; mib=$3
-        if (pid=="" || pid=="No running processes found") next
-        if (pid !~ /^[0-9]+$/) next
-        if (mib=="") mib=0
-        # If a PID appears in both compute and graphics queries, keep the max MiB.
-        key=pid "\t" name
-        if (mib+0 > mem[key]+0) mem[key]=mib+0
-      }
-      END{
-        for (k in mem) {
-          split(k, a, "\t");
-          printf "%s\t%s\t%d\n", a[1], a[2], mem[k]
+  # Note: On Windows WDDM, nvidia-smi often reports per-process GPU memory as N/A.
+  # In that case, use Windows performance counters for per-process dedicated usage.
+  if is_windows_bash; then
+    powershell -NoProfile -Command '
+      $items = Get-CimInstance -Namespace root/cimv2 -ClassName Win32_PerfFormattedData_GPUPerformanceCounters_GPUProcessMemory |
+        Where-Object { $_.DedicatedUsage -gt 0 -and $_.Name -match "^pid_(\d+)_" } |
+        ForEach-Object {
+          if ($_.Name -match "^pid_(\d+)_") {
+            [pscustomobject]@{ Pid = [int]$Matches[1]; MiB = [int64]($_.DedicatedUsage / 1MB) }
+          }
         }
-      }' \
-    | sort -k3,3nr -k1,1n
+
+      $grouped = $items | Group-Object -Property Pid | ForEach-Object {
+        # Avoid $PID (built-in, read-only) by using a different variable name.
+        $procPid = [int]$_.Name
+        $mib = [int64](($_.Group | Measure-Object -Property MiB -Sum).Sum)
+        if ($mib -le 0) { return }
+        $p = Get-Process -Id $procPid -ErrorAction SilentlyContinue
+        $name = if ($p) { $p.ProcessName } else { "<unknown>" }
+        [pscustomobject]@{ Pid=$procPid; Name=$name; MiB=$mib }
+      } | Sort-Object -Property MiB -Descending
+
+      $grouped | ForEach-Object { "{0}`t{1}`t{2}" -f $_.Pid, $_.Name, $_.MiB }
+    ' 2>/dev/null | awk -F'	' 'NF==3 {print}'
+    return 0
+  fi
+
+  list_apps_raw |
+    awk -F',' '{
+      for (i=1;i<=NF;i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i) }
+      pid=$1; name=$2; mib=$3
+      if (pid=="" || pid=="No running processes found") next
+      if (pid !~ /^[0-9]+$/) next
+      if (mib=="" || mib=="N/A") mib=0
+      key=pid "\t" name
+      if (mib+0 > mem[key]+0) mem[key]=mib+0
+    }
+    END{
+      for (k in mem) {
+        if (mem[k]+0 <= 0) continue
+        split(k, a, "\t");
+        printf "%s\t%s\t%d\n", a[1], a[2], mem[k]
+      }
+    }' |
+    sort -k3,3nr -k1,1n
 }
 
 do_kill_pid() {
@@ -106,7 +133,13 @@ do_kill_pid() {
 
 print_screen() {
   command -v clear >/dev/null 2>&1 && clear || true
-  echo "GPU Processes (from nvidia-smi)"
+  echo "GPU Processes"
+  # Show the overall memory usage even if per-process breakdown isn't available.
+  local mem
+  mem="$(nvidia-smi --query-gpu=memory.used,memory.total --format=csv,noheader,nounits 2>/dev/null || true)"
+  if [[ -n "${mem//[[:space:]]/}" ]]; then
+    echo "Total VRAM used: $(echo "$mem" | awk -F',' '{gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); printf "%.2f/%.2f GB", ($1/1024.0), ($2/1024.0)}')"
+  fi
   echo
   local rows
   rows="$(list_apps)"
