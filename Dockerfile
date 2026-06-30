@@ -1,15 +1,27 @@
-FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04
+FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
+ENV HY3DGEN_MODELS=/workspace/cache/hy3dgen
 ENV HF_HOME=/workspace/cache/huggingface
+ENV HF_HUB_CACHE=/workspace/cache/huggingface/hub
+ENV HUGGINGFACE_HUB_CACHE=/workspace/cache/huggingface/hub
 ENV TORCH_HOME=/workspace/cache/torch
+ENV U2NET_HOME=/workspace/cache/u2net
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
 # Docker builds don't have access to the GPU, so Torch can't auto-detect arch.
 # 4090 = Ada (SM 8.9). Without this, CUDA extensions may compile without sm_89.
 ENV TORCH_CUDA_ARCH_LIST=8.9
 
 WORKDIR /workspace/Hunyuan3D-2
+
+# Pre-create cache/output directories (they can be mounted as volumes at runtime).
+RUN mkdir -p \
+    /workspace/cache/hy3dgen \
+    /workspace/cache/huggingface/hub \
+    /workspace/cache/torch \
+    /workspace/cache/u2net \
+    /workspace/outputs
 
 RUN apt-get update && apt-get install -y \
     git \
@@ -36,9 +48,13 @@ RUN python -m pip install --upgrade pip setuptools wheel
 
 COPY . /workspace/Hunyuan3D-2
 
-RUN python -m pip install --no-cache-dir torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+RUN python -m pip install \
+    torch==2.6.0+cu124 \
+    torchvision==0.21.0+cu124 \
+    torchaudio==2.6.0+cu124 \
+    --index-url https://download.pytorch.org/whl/cu124
 
-RUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121; fi
+RUN if [ -f requirements.txt ]; then python -m pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124; fi
 
 # Install the package itself (gradio_app imports hy3dgen as a package)
 RUN python -m pip install --no-cache-dir -e .
@@ -52,5 +68,8 @@ RUN python -m pip install --no-cache-dir --no-build-isolation ./hy3dgen/texgen/c
 
 EXPOSE 7860
 
+# Persist these across container restarts by mounting volumes.
+VOLUME ["/workspace/cache", "/workspace/outputs"]
+
 ENTRYPOINT ["python", "gradio_app.py"]
-CMD ["--host", "0.0.0.0", "--port", "7860", "--cache-path", "/workspace/outputs"]
+CMD ["--host", "0.0.0.0", "--port", "7860", "--cache-path", "/workspace/outputs", "--model-cache-dir", "/workspace/cache", "--lazy_load_models", "--idle_unload_sec", "600"]

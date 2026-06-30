@@ -16,6 +16,8 @@ import os
 import random
 import shutil
 import time
+import gc
+import threading
 from glob import glob
 from pathlib import Path
 
@@ -30,6 +32,224 @@ import uuid
 from hy3dgen.shapegen.utils import logger
 
 MAX_SEED = int(1e7)
+
+
+# Lazily-initialized workers (models can consume significant CPU/GPU RAM).
+# These globals are bound in __main__ and accessed via get_*() helpers.
+_WORKER_LOCK = threading.RLock()
+_LAST_USE_TS = 0.0
+_ACTIVE_CALLS = 0
+
+i23d_worker = None
+rmbg_worker = None
+texgen_worker = None
+t2i_worker = None
+
+floater_remove_worker = None
+degenerate_face_remove_worker = None
+face_reduce_worker = None
+
+# Lazy-imported symbols from hy3dgen
+Hunyuan3DDiTFlowMatchingPipeline = None
+FaceReducer = None
+FloaterRemover = None
+DegenerateFaceRemover = None
+export_to_trimesh = None
+BackgroundRemover = None
+Hunyuan3DPaintPipeline = None
+HunyuanDiTPipeline = None
+
+
+def _touch_last_use() -> None:
+    global _LAST_USE_TS
+    _LAST_USE_TS = time.monotonic()
+
+
+class _ActiveCall:
+    def __enter__(self):
+        global _ACTIVE_CALLS
+        with _WORKER_LOCK:
+            _ACTIVE_CALLS += 1
+            _touch_last_use()
+
+    def __exit__(self, exc_type, exc, tb):
+        global _ACTIVE_CALLS
+        with _WORKER_LOCK:
+            _ACTIVE_CALLS = max(0, _ACTIVE_CALLS - 1)
+            _touch_last_use()
+
+
+def _lazy_import_shapegen() -> None:
+    global Hunyuan3DDiTFlowMatchingPipeline, FaceReducer, FloaterRemover, DegenerateFaceRemover, export_to_trimesh
+    if Hunyuan3DDiTFlowMatchingPipeline is not None:
+        return
+    from hy3dgen.shapegen import (
+        FaceReducer as _FaceReducer,
+        FloaterRemover as _FloaterRemover,
+        DegenerateFaceRemover as _DegenerateFaceRemover,
+        Hunyuan3DDiTFlowMatchingPipeline as _Hunyuan3DDiTFlowMatchingPipeline,
+    )
+    from hy3dgen.shapegen.pipelines import export_to_trimesh as _export_to_trimesh
+
+    FaceReducer = _FaceReducer
+    FloaterRemover = _FloaterRemover
+    DegenerateFaceRemover = _DegenerateFaceRemover
+    Hunyuan3DDiTFlowMatchingPipeline = _Hunyuan3DDiTFlowMatchingPipeline
+    export_to_trimesh = _export_to_trimesh
+
+
+def _lazy_import_rembg() -> None:
+    global BackgroundRemover
+    if BackgroundRemover is not None:
+        return
+    from hy3dgen.rembg import BackgroundRemover as _BackgroundRemover
+
+    BackgroundRemover = _BackgroundRemover
+
+
+def _lazy_import_texgen() -> None:
+    global Hunyuan3DPaintPipeline
+    if Hunyuan3DPaintPipeline is not None:
+        return
+    from hy3dgen.texgen import Hunyuan3DPaintPipeline as _Hunyuan3DPaintPipeline
+
+    Hunyuan3DPaintPipeline = _Hunyuan3DPaintPipeline
+
+
+def _lazy_import_t2i() -> None:
+    global HunyuanDiTPipeline
+    if HunyuanDiTPipeline is not None:
+        return
+    from hy3dgen.text2image import HunyuanDiTPipeline as _HunyuanDiTPipeline
+
+    HunyuanDiTPipeline = _HunyuanDiTPipeline
+
+
+def unload_models(reason: str = "") -> None:
+    """Best-effort release of model RAM/VRAM. Safe to call repeatedly."""
+    global i23d_worker, rmbg_worker, texgen_worker, t2i_worker
+    global floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker
+
+    with _WORKER_LOCK:
+        if _ACTIVE_CALLS != 0:
+            return
+
+        i23d_worker = None
+        rmbg_worker = None
+        texgen_worker = None
+        t2i_worker = None
+
+        floater_remove_worker = None
+        degenerate_face_remove_worker = None
+        face_reduce_worker = None
+
+    # Make sure references are gone before collecting.
+    gc.collect()
+
+    # For CUDA, this drops PyTorch's caching allocator blocks back to the driver.
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+    if reason:
+        print(f"[idle-unload] Unloaded models ({reason}).")
+
+
+def get_export_to_trimesh():
+    _lazy_import_shapegen()
+    return export_to_trimesh
+
+
+def get_rmbg_worker():
+    global rmbg_worker
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if rmbg_worker is None:
+            _lazy_import_rembg()
+            rmbg_worker = BackgroundRemover()
+        return rmbg_worker
+
+
+def get_i23d_worker():
+    global i23d_worker
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if i23d_worker is None:
+            _lazy_import_shapegen()
+            i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                args.model_path,
+                subfolder=args.subfolder,
+                use_safetensors=True,
+                device=args.device,
+            )
+            if args.enable_flashvdm:
+                mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
+                i23d_worker.enable_flashvdm(mc_algo=mc_algo)
+            if args.compile:
+                i23d_worker.compile()
+        return i23d_worker
+
+
+def get_floater_remove_worker():
+    global floater_remove_worker
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if floater_remove_worker is None:
+            _lazy_import_shapegen()
+            floater_remove_worker = FloaterRemover()
+        return floater_remove_worker
+
+
+def get_degenerate_face_remove_worker():
+    global degenerate_face_remove_worker
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if degenerate_face_remove_worker is None:
+            _lazy_import_shapegen()
+            degenerate_face_remove_worker = DegenerateFaceRemover()
+        return degenerate_face_remove_worker
+
+
+def get_face_reduce_worker():
+    global face_reduce_worker
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if face_reduce_worker is None:
+            _lazy_import_shapegen()
+            face_reduce_worker = FaceReducer()
+        return face_reduce_worker
+
+
+def get_texgen_worker():
+    global texgen_worker
+    if args.disable_tex:
+        raise gr.Error("Texture synthesis is disabled (started with --disable_tex).")
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if texgen_worker is None:
+            _lazy_import_texgen()
+            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
+            if args.low_vram_mode:
+                texgen_worker.enable_model_cpu_offload()
+        return texgen_worker
+
+
+def get_t2i_worker():
+    global t2i_worker
+    if not args.enable_t23d:
+        raise gr.Error("Text to 3D is disable. To activate it, please run `python gradio_app.py --enable_t23d`.")
+    with _WORKER_LOCK:
+        _touch_last_use()
+        if t2i_worker is None:
+            _lazy_import_t2i()
+            t2i_worker = HunyuanDiTPipeline(
+                'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
+                device=args.device,
+            )
+        return t2i_worker
 
 
 def get_example_img_list():
@@ -149,6 +369,7 @@ def _gen_shape(
 ):
     if not MV_MODE and image is None and caption is None:
         raise gr.Error("Please provide either a caption or an image.")
+
     if MV_MODE:
         if mv_image_front is None and mv_image_back is None and mv_image_left is None and mv_image_right is None:
             raise gr.Error("Please provide at least one view image.")
@@ -165,7 +386,9 @@ def _gen_shape(
     seed = int(randomize_seed_fn(seed, randomize_seed))
 
     octree_resolution = int(octree_resolution)
-    if caption: print('prompt is', caption)
+    if caption:
+        print('prompt is', caption)
+
     save_folder = gen_save_folder()
     stats = {
         'model': {
@@ -186,25 +409,24 @@ def _gen_shape(
 
     if image is None:
         start_time = time.time()
-        try:
-            image = t2i_worker(caption)
-        except Exception as e:
-            raise gr.Error(f"Text to 3D is disable. Please enable it by `python gradio_app.py --enable_t23d`.")
+        image = get_t2i_worker()(caption)
         time_meta['text2image'] = time.time() - start_time
 
     # remove disk io to make responding faster, uncomment at your will.
     # image.save(os.path.join(save_folder, 'input.png'))
+
+    _rmbg = get_rmbg_worker()
     if MV_MODE:
         start_time = time.time()
         for k, v in image.items():
             if check_box_rembg or v.mode == "RGB":
-                img = rmbg_worker(v.convert('RGB'))
+                img = _rmbg(v.convert('RGB'))
                 image[k] = img
         time_meta['remove background'] = time.time() - start_time
     else:
         if check_box_rembg or image.mode == "RGB":
             start_time = time.time()
-            image = rmbg_worker(image.convert('RGB'))
+            image = _rmbg(image.convert('RGB'))
             time_meta['remove background'] = time.time() - start_time
 
     # remove disk io to make responding faster, uncomment at your will.
@@ -212,10 +434,8 @@ def _gen_shape(
 
     # image to white model
     start_time = time.time()
-
-    generator = torch.Generator()
-    generator = generator.manual_seed(int(seed))
-    outputs = i23d_worker(
+    generator = torch.Generator().manual_seed(int(seed))
+    outputs = get_i23d_worker()(
         image=image,
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
@@ -228,7 +448,7 @@ def _gen_shape(
     logger.info("---Shape generation takes %s seconds ---" % (time.time() - start_time))
 
     tmp_start = time.time()
-    mesh = export_to_trimesh(outputs)[0]
+    mesh = get_export_to_trimesh()(outputs)[0]
     time_meta['export to trimesh'] = time.time() - tmp_start
 
     stats['number_of_faces'] = mesh.faces.shape[0]
@@ -254,23 +474,24 @@ def generation_all(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
-    start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
-        caption,
-        image,
-        mv_image_front=mv_image_front,
-        mv_image_back=mv_image_back,
-        mv_image_left=mv_image_left,
-        mv_image_right=mv_image_right,
-        steps=steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
-        octree_resolution=octree_resolution,
-        check_box_rembg=check_box_rembg,
-        num_chunks=num_chunks,
-        randomize_seed=randomize_seed,
-    )
-    path = export_mesh(mesh, save_folder, textured=False)
+    with _ActiveCall():
+        start_time_0 = time.time()
+        mesh, image, save_folder, stats, seed = _gen_shape(
+            caption,
+            image,
+            mv_image_front=mv_image_front,
+            mv_image_back=mv_image_back,
+            mv_image_left=mv_image_left,
+            mv_image_right=mv_image_right,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            octree_resolution=octree_resolution,
+            check_box_rembg=check_box_rembg,
+            num_chunks=num_chunks,
+            randomize_seed=randomize_seed,
+        )
+        path = export_mesh(mesh, save_folder, textured=False)
 
     # tmp_time = time.time()
     # mesh = floater_remove_worker(mesh)
@@ -278,30 +499,34 @@ def generation_all(
     # logger.info("---Postprocessing takes %s seconds ---" % (time.time() - tmp_time))
     # stats['time']['postprocessing'] = time.time() - tmp_time
 
-    tmp_time = time.time()
-    mesh = face_reduce_worker(mesh)
-    logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['face reduction'] = time.time() - tmp_time
+        tmp_time = time.time()
+        mesh = get_face_reduce_worker()(mesh)
+        logger.info("---Face Reduction takes %s seconds ---" % (time.time() - tmp_time))
+        stats['time']['face reduction'] = time.time() - tmp_time
 
-    tmp_time = time.time()
-    textured_mesh = texgen_worker(mesh, image)
-    logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
-    stats['time']['texture generation'] = time.time() - tmp_time
-    stats['time']['total'] = time.time() - start_time_0
+        tmp_time = time.time()
+        textured_mesh = get_texgen_worker()(mesh, image)
+        logger.info("---Texture Generation takes %s seconds ---" % (time.time() - tmp_time))
+        stats['time']['texture generation'] = time.time() - tmp_time
+        stats['time']['total'] = time.time() - start_time_0
 
-    textured_mesh.metadata['extras'] = stats
-    path_textured = export_mesh(textured_mesh, save_folder, textured=True)
-    model_viewer_html_textured = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                         textured=True)
-    if args.low_vram_mode:
-        torch.cuda.empty_cache()
-    return (
-        gr.update(value=path),
-        gr.update(value=path_textured),
-        model_viewer_html_textured,
-        stats,
-        seed,
-    )
+        textured_mesh.metadata['extras'] = stats
+        path_textured = export_mesh(textured_mesh, save_folder, textured=True)
+        model_viewer_html_textured = build_model_viewer_html(
+            save_folder,
+            height=HTML_HEIGHT,
+            width=HTML_WIDTH,
+            textured=True,
+        )
+        if args.low_vram_mode:
+            torch.cuda.empty_cache()
+        return (
+            gr.update(value=path),
+            gr.update(value=path_textured),
+            model_viewer_html_textured,
+            stats,
+            seed,
+        )
 
 
 def shape_generation(
@@ -319,35 +544,36 @@ def shape_generation(
     num_chunks=200000,
     randomize_seed: bool = False,
 ):
-    start_time_0 = time.time()
-    mesh, image, save_folder, stats, seed = _gen_shape(
-        caption,
-        image,
-        mv_image_front=mv_image_front,
-        mv_image_back=mv_image_back,
-        mv_image_left=mv_image_left,
-        mv_image_right=mv_image_right,
-        steps=steps,
-        guidance_scale=guidance_scale,
-        seed=seed,
-        octree_resolution=octree_resolution,
-        check_box_rembg=check_box_rembg,
-        num_chunks=num_chunks,
-        randomize_seed=randomize_seed,
-    )
-    stats['time']['total'] = time.time() - start_time_0
-    mesh.metadata['extras'] = stats
+    with _ActiveCall():
+        start_time_0 = time.time()
+        mesh, image, save_folder, stats, seed = _gen_shape(
+            caption,
+            image,
+            mv_image_front=mv_image_front,
+            mv_image_back=mv_image_back,
+            mv_image_left=mv_image_left,
+            mv_image_right=mv_image_right,
+            steps=steps,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            octree_resolution=octree_resolution,
+            check_box_rembg=check_box_rembg,
+            num_chunks=num_chunks,
+            randomize_seed=randomize_seed,
+        )
+        stats['time']['total'] = time.time() - start_time_0
+        mesh.metadata['extras'] = stats
 
-    path = export_mesh(mesh, save_folder, textured=False)
-    model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH)
-    if args.low_vram_mode:
-        torch.cuda.empty_cache()
-    return (
-        gr.update(value=path),
-        model_viewer_html,
-        stats,
-        seed,
-    )
+        path = export_mesh(mesh, save_folder, textured=False)
+        model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH)
+        if args.low_vram_mode:
+            torch.cuda.empty_cache()
+        return (
+            gr.update(value=path),
+            model_viewer_html,
+            stats,
+            seed,
+        )
 
 
 def build_app():
@@ -597,37 +823,46 @@ def build_app():
         decode_mode.change(on_decode_mode_change, inputs=[decode_mode], outputs=[octree_resolution])
 
         def on_export_click(file_out, file_out2, file_type, reduce_face, export_texture, target_face_num):
-            if file_out is None:
-                raise gr.Error('Please generate a mesh first.')
+            with _ActiveCall():
+                if file_out is None:
+                    raise gr.Error('Please generate a mesh first.')
 
-            print(f'exporting {file_out}')
-            print(f'reduce face to {target_face_num}')
-            if export_texture:
-                mesh = trimesh.load(file_out2)
-                save_folder = gen_save_folder()
-                path = export_mesh(mesh, save_folder, textured=True, type=file_type)
+                print(f'exporting {file_out}')
+                print(f'reduce face to {target_face_num}')
+                if export_texture:
+                    mesh = trimesh.load(file_out2)
+                    save_folder = gen_save_folder()
+                    path = export_mesh(mesh, save_folder, textured=True, type=file_type)
 
-                # for preview
-                save_folder = gen_save_folder()
-                _ = export_mesh(mesh, save_folder, textured=True)
-                model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                            textured=True)
-            else:
-                mesh = trimesh.load(file_out)
-                mesh = floater_remove_worker(mesh)
-                mesh = degenerate_face_remove_worker(mesh)
-                if reduce_face:
-                    mesh = face_reduce_worker(mesh, target_face_num)
-                save_folder = gen_save_folder()
-                path = export_mesh(mesh, save_folder, textured=False, type=file_type)
+                    # for preview
+                    save_folder = gen_save_folder()
+                    _ = export_mesh(mesh, save_folder, textured=True)
+                    model_viewer_html = build_model_viewer_html(
+                        save_folder,
+                        height=HTML_HEIGHT,
+                        width=HTML_WIDTH,
+                        textured=True,
+                    )
+                else:
+                    mesh = trimesh.load(file_out)
+                    mesh = get_floater_remove_worker()(mesh)
+                    mesh = get_degenerate_face_remove_worker()(mesh)
+                    if reduce_face:
+                        mesh = get_face_reduce_worker()(mesh, target_face_num)
+                    save_folder = gen_save_folder()
+                    path = export_mesh(mesh, save_folder, textured=False, type=file_type)
 
-                # for preview
-                save_folder = gen_save_folder()
-                _ = export_mesh(mesh, save_folder, textured=False)
-                model_viewer_html = build_model_viewer_html(save_folder, height=HTML_HEIGHT, width=HTML_WIDTH,
-                                                            textured=False)
-            print(f'export to {path}')
-            return model_viewer_html, gr.update(value=path, interactive=True)
+                    # for preview
+                    save_folder = gen_save_folder()
+                    _ = export_mesh(mesh, save_folder, textured=False)
+                    model_viewer_html = build_model_viewer_html(
+                        save_folder,
+                        height=HTML_HEIGHT,
+                        width=HTML_WIDTH,
+                        textured=False,
+                    )
+                print(f'export to {path}')
+                return model_viewer_html, gr.update(value=path, interactive=True)
 
         confirm_export.click(
             lambda: gr.update(selected='export_mesh_panel'),
@@ -644,6 +879,49 @@ def build_app():
 if __name__ == '__main__':
     import argparse
 
+    def _load_dotenv_if_present(dotenv_path: Path) -> None:
+        """Minimal .env loader (no external deps).
+
+        Only fills missing environment variables (does not override existing ones).
+        """
+        try:
+            if not dotenv_path.is_file():
+                return
+            for raw_line in dotenv_path.read_text(encoding='utf-8').splitlines():
+                line = raw_line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if line.startswith('export '):
+                    line = line[len('export '):].lstrip()
+                if '=' not in line:
+                    continue
+                key, value = line.split('=', 1)
+                key = key.strip()
+                value = value.strip()
+                if not key:
+                    continue
+                if (
+                    len(value) >= 2
+                    and ((value[0] == value[-1] == '"') or (value[0] == value[-1] == "'"))
+                ):
+                    value = value[1:-1]
+                os.environ.setdefault(key, value)
+        except Exception as e:
+            print(f"Failed to read .env from {dotenv_path}: {e}")
+
+    def _env_float(name: str) -> float | None:
+        val = os.getenv(name)
+        if val is None or val == '':
+            return None
+        try:
+            return float(val)
+        except ValueError:
+            print(f"Invalid {name}={val!r}; ignoring.")
+            return None
+
+    # Load .env from the same folder as this script (repo root in this project).
+    _load_dotenv_if_present(Path(__file__).with_name('.env'))
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, default='tencent/Hunyuan3D-2mini')
     parser.add_argument("--subfolder", type=str, default='hunyuan3d-dit-v2-mini-turbo')
@@ -653,11 +931,30 @@ if __name__ == '__main__':
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--mc_algo', type=str, default='mc')
     parser.add_argument('--cache-path', type=str, default='gradio_cache')
+    parser.add_argument(
+        '--model-cache-dir',
+        '--model_cache_dir',
+        dest='model_cache_dir',
+        type=str,
+        default='cache',
+        help='Persistent directory for model weights (Hunyuan3D/HF/rembg). Mount this as a volume in Docker to avoid re-downloading.',
+    )
     parser.add_argument('--enable_t23d', action='store_true')
     parser.add_argument('--disable_tex', action='store_true')
     parser.add_argument('--enable_flashvdm', action='store_true')
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
+    parser.add_argument(
+        '--lazy_load_models',
+        action='store_true',
+        help='Defer loading large models until first use (slower first request, lower startup RAM/VRAM).',
+    )
+    parser.add_argument(
+        '--idle_unload_sec',
+        type=float,
+        default=(lambda _v: _v if _v is not None else 0.0)(_env_float('HY3D_IDLE_SECONDS')),
+        help='Unload models after N seconds of inactivity (0 disables). You can also set HY3D_IDLE_SECONDS (e.g. via .env).',
+    )
     parser.add_argument(
         '--max_vram_gb',
         type=float,
@@ -665,6 +962,19 @@ if __name__ == '__main__':
         help='Best-effort VRAM cap (CUDA only). You can also set HY3D_MAX_VRAM_GB.',
     )
     args = parser.parse_args()
+
+    def _configure_model_caches(root_dir: str) -> None:
+        root = Path(root_dir).absolute()
+        # 1) HY3DGEN internal weights (used by hy3dgen.shapegen/texgen smart loaders)
+        os.environ.setdefault('HY3DGEN_MODELS', str(root / 'hy3dgen'))
+        # 2) HuggingFace Hub cache (used by diffusers/transformers/controlnets, etc.)
+        os.environ.setdefault('HF_HOME', str(root / 'huggingface'))
+        os.environ.setdefault('HF_HUB_CACHE', str(root / 'huggingface' / 'hub'))
+        os.environ.setdefault('HUGGINGFACE_HUB_CACHE', str(root / 'huggingface' / 'hub'))
+        # 3) rembg u2net weights (prevents downloads into /root/.u2net)
+        os.environ.setdefault('U2NET_HOME', str(root / 'u2net'))
+
+    _configure_model_caches(args.model_cache_dir)
 
     if args.max_vram_gb is None:
         _env_max_vram = os.getenv('HY3D_MAX_VRAM_GB')
@@ -739,52 +1049,60 @@ if __name__ == '__main__':
     HAS_TEXTUREGEN = False
     if not args.disable_tex:
         try:
-            from hy3dgen.texgen import Hunyuan3DPaintPipeline
-
-            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            if args.low_vram_mode:
-                texgen_worker.enable_model_cpu_offload()
-            # Not help much, ignore for now.
-            # if args.compile:
-            #     texgen_worker.models['delight_model'].pipeline.unet.compile()
-            #     texgen_worker.models['delight_model'].pipeline.vae.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.unet.compile()
-            #     texgen_worker.models['multiview_model'].pipeline.vae.compile()
+            # Just a dependency check; actual model load happens on first use.
+            _lazy_import_texgen()
             HAS_TEXTUREGEN = True
         except Exception as e:
             print(e)
-            print("Failed to load texture generator.")
+            print("Failed to import texture generator.")
             print('Please try to install requirements by following README.md')
             HAS_TEXTUREGEN = False
 
+    # Keep the current UX: show the Text Prompt tab, but raise an error if used without --enable_t23d.
     HAS_T2I = True
-    if args.enable_t23d:
-        from hy3dgen.text2image import HunyuanDiTPipeline
 
-        t2i_worker = HunyuanDiTPipeline('Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled', device=args.device)
-        HAS_T2I = True
+    if not args.lazy_load_models:
+        # Preserve current behavior: load core models on startup.
+        get_rmbg_worker()
+        get_i23d_worker()
+        get_floater_remove_worker()
+        get_degenerate_face_remove_worker()
+        get_face_reduce_worker()
+        if HAS_TEXTUREGEN:
+            try:
+                get_texgen_worker()
+            except Exception as e:
+                print(e)
+                print("Failed to load texture generator.")
+                HAS_TEXTUREGEN = False
+        if args.enable_t23d:
+            get_t2i_worker()
 
-    from hy3dgen.shapegen import FaceReducer, FloaterRemover, DegenerateFaceRemover, MeshSimplifier, \
-        Hunyuan3DDiTFlowMatchingPipeline
-    from hy3dgen.shapegen.pipelines import export_to_trimesh
-    from hy3dgen.rembg import BackgroundRemover
+    if args.idle_unload_sec and args.idle_unload_sec > 0:
+        def _idle_unload_loop():
+            interval = max(1.0, min(30.0, args.idle_unload_sec / 4.0))
+            while True:
+                time.sleep(interval)
+                now = time.monotonic()
+                with _WORKER_LOCK:
+                    idle_for = now - _LAST_USE_TS if _LAST_USE_TS else 0.0
+                    any_loaded = any(
+                        x is not None
+                        for x in (
+                            i23d_worker,
+                            rmbg_worker,
+                            texgen_worker,
+                            t2i_worker,
+                            floater_remove_worker,
+                            degenerate_face_remove_worker,
+                            face_reduce_worker,
+                        )
+                    )
+                    active = _ACTIVE_CALLS
+                if any_loaded and active == 0 and idle_for >= args.idle_unload_sec:
+                    unload_models(reason=f"idle_for={idle_for:.0f}s")
 
-    rmbg_worker = BackgroundRemover()
-    i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-        args.model_path,
-        subfolder=args.subfolder,
-        use_safetensors=True,
-        device=args.device,
-    )
-    if args.enable_flashvdm:
-        mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-        i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-    if args.compile:
-        i23d_worker.compile()
-
-    floater_remove_worker = FloaterRemover()
-    degenerate_face_remove_worker = DegenerateFaceRemover()
-    face_reduce_worker = FaceReducer()
+        threading.Thread(target=_idle_unload_loop, daemon=True).start()
 
     # https://discuss.huggingface.co/t/how-to-serve-an-html-file/33921/2
     # create a FastAPI app

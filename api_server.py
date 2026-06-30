@@ -27,6 +27,7 @@ import threading
 import traceback
 import uuid
 from io import BytesIO
+from pathlib import Path
 
 import torch
 import trimesh
@@ -134,6 +135,19 @@ def pretty_print_semaphore(semaphore):
 
 SAVE_DIR = 'gradio_cache'
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+
+def _configure_model_caches(root_dir: str) -> None:
+    # Keep model weights in a persistent folder (mount as a Docker volume) to avoid re-downloading.
+    root = Path(root_dir).absolute()
+    os.environ.setdefault('HY3DGEN_MODELS', str(root / 'hy3dgen'))
+    os.environ.setdefault('HF_HOME', str(root / 'huggingface'))
+    os.environ.setdefault('HF_HUB_CACHE', str(root / 'huggingface' / 'hub'))
+    os.environ.setdefault('HUGGINGFACE_HUB_CACHE', str(root / 'huggingface' / 'hub'))
+    os.environ.setdefault('U2NET_HOME', str(root / 'u2net'))
+
+
+_configure_model_caches(os.environ.get('HY3D_MODEL_CACHE_DIR', 'cache'))
 
 worker_id = str(uuid.uuid4())[:6]
 logger = build_logger("controller", f"{SAVE_DIR}/controller.log")

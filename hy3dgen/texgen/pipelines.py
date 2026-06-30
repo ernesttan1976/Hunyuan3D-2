@@ -57,23 +57,37 @@ class Hunyuan3DPaintPipeline:
         if not os.path.exists(model_path):
             # try local path
             base_dir = os.environ.get('HY3DGEN_MODELS', '~/.cache/hy3dgen')
-            model_path = os.path.expanduser(os.path.join(base_dir, model_path))
+            base_dir = os.path.expanduser(base_dir)
+            local_repo_dir = os.path.join(base_dir, model_path)
+            model_path = local_repo_dir
 
             delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
             multiview_model_path = os.path.join(model_path, subfolder)
 
             if not os.path.exists(delight_model_path) or not os.path.exists(multiview_model_path):
                 try:
-                    import huggingface_hub
-                    # download from huggingface
-                    model_path = huggingface_hub.snapshot_download(
-                        repo_id=original_model_path, allow_patterns=["hunyuan3d-delight-v2-0/*"]
-                    )
-                    model_path = huggingface_hub.snapshot_download(
-                        repo_id=original_model_path, allow_patterns=[f'{subfolder}/*']
-                    )
-                    delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
-                    multiview_model_path = os.path.join(model_path, subfolder)
+                    from huggingface_hub import snapshot_download
+
+                    os.makedirs(local_repo_dir, exist_ok=True)
+                    allow_patterns = [
+                        "hunyuan3d-delight-v2-0/*",
+                        f"{subfolder}/*",
+                    ]
+                    try:
+                        snapshot_download(
+                            repo_id=original_model_path,
+                            allow_patterns=allow_patterns,
+                            local_dir=local_repo_dir,
+                            local_dir_use_symlinks=False,
+                        )
+                    except TypeError:
+                        snapshot_download(
+                            repo_id=original_model_path,
+                            allow_patterns=allow_patterns,
+                        )
+
+                    delight_model_path = os.path.join(local_repo_dir, 'hunyuan3d-delight-v2-0')
+                    multiview_model_path = os.path.join(local_repo_dir, subfolder)
                     return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
                 except Exception:
                     import traceback

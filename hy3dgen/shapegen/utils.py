@@ -95,18 +95,33 @@ def smart_load_model(
     original_model_path = model_path
     # try local path
     base_dir = os.environ.get('HY3DGEN_MODELS', '~/.cache/hy3dgen')
-    model_path = os.path.expanduser(os.path.join(base_dir, model_path, subfolder))
+    base_dir = os.path.expanduser(base_dir)
+    local_repo_dir = os.path.join(base_dir, model_path)
+    model_path = os.path.join(local_repo_dir, subfolder)
     logger.info(f'Try to load model from local path: {model_path}')
     if not os.path.exists(model_path):
         logger.info('Model path not exists, try to download from huggingface')
         try:
             from huggingface_hub import snapshot_download
-            # 只下载指定子目录
-            path = snapshot_download(
-                repo_id=original_model_path,
-                allow_patterns=[f"{subfolder}/*"],  # 关键修改：模式匹配子文件夹
-            )
-            model_path = os.path.join(path, subfolder)  # 保持路径拼接逻辑不变
+            os.makedirs(local_repo_dir, exist_ok=True)
+
+            # Download only the requested subfolder into HY3DGEN_MODELS so subsequent runs
+            # don't need to hit the network (assuming the cache dir persists).
+            try:
+                snapshot_download(
+                    repo_id=original_model_path,
+                    allow_patterns=[f"{subfolder}/*"],
+                    local_dir=local_repo_dir,
+                    local_dir_use_symlinks=False,
+                )
+            except TypeError:
+                # Older huggingface_hub versions don't support local_dir/local_dir_use_symlinks.
+                snapshot_download(
+                    repo_id=original_model_path,
+                    allow_patterns=[f"{subfolder}/*"],
+                )
+
+            model_path = os.path.join(local_repo_dir, subfolder)
         except ImportError:
             logger.warning(
                 "You need to install HuggingFace Hub to load models from the hub."

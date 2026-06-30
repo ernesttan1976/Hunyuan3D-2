@@ -60,11 +60,18 @@ MSYS_NO_PATHCONV=1 docker run --gpus all -d \
   -p 7860:7860 \
   --ipc=host \
   --env-file "D:/Hunyuan3D-2/.env" \
-  -e HY3D_MAX_VRAM_GB=8 \
+  -e HY3D_MAX_VRAM_GB=16 \
   -v /d/Hunyuan3D-2/outputs:/workspace/outputs \
   -v /d/Hunyuan3D-2/cache:/workspace/cache \
   --name hunyuan3d-2 \
-  hunyuan3d-2
+  hunyuan3d-2:test
+```
+
+```
+docker run --gpus all -d -p 7860:7860 \
+  -v $(pwd)/cache:/workspace/cache \
+  -v $(pwd)/outputs:/workspace/outputs \
+  hunyuan3d-2:test
 ```
 
 Open:
