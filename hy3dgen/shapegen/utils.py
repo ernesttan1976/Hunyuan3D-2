@@ -109,6 +109,7 @@ def smart_load_model(
     subfolder,
     use_safetensors,
     variant,
+    force_redownload: bool = False,
 ):
     original_model_path = model_path
     # try local path
@@ -117,10 +118,10 @@ def smart_load_model(
     local_repo_dir = os.path.join(base_dir, model_path)
     model_path = os.path.join(local_repo_dir, subfolder)
     logger.info(f'Try to load model from local path: {model_path}')
-    if not os.path.exists(model_path):
-        logger.info('Model path not exists, try to download from huggingface')
+    def _download_subfolder(force: bool = False):
         try:
             from huggingface_hub import snapshot_download
+
             os.makedirs(local_repo_dir, exist_ok=True)
 
             # Download only the requested subfolder into HY3DGEN_MODELS so subsequent runs
@@ -131,54 +132,11 @@ def smart_load_model(
                     allow_patterns=[f"{subfolder}/*"],
                     local_dir=local_repo_dir,
                     local_dir_use_symlinks=False,
-                )
-            except TypeError:
-                # Older huggingface_hub versions don't support local_dir/local_dir_use_symlinks.
-                snapshot_download(
-                    repo_id=original_model_path,
-                    allow_patterns=[f"{subfolder}/*"],
-                )
-
-            model_path = os.path.join(local_repo_dir, subfolder)
-        except ImportError:
-            logger.warning(
-                "You need to install HuggingFace Hub to load models from the hub."
-            )
-            raise RuntimeError(f"Model path {model_path} not found")
-        except Exception as e:
-            raise e
-
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model path {original_model_path} not found")
-
-    extension = 'ckpt' if not use_safetensors else 'safetensors'
-    variant = '' if variant is None else f'.{variant}'
-    ckpt_name = f'model{variant}.{extension}'
-    config_path = os.path.join(model_path, 'config.yaml')
-    ckpt_path = os.path.join(model_path, ckpt_name)
-
-    # If a checkpoint exists but is corrupt (common with large files), delete and re-download.
-    if use_safetensors and os.path.exists(ckpt_path) and not _is_valid_safetensors_file(ckpt_path):
-        logger.warning(f"Corrupted checkpoint detected: {ckpt_path}. Will re-download {original_model_path}/{subfolder}.")
-        try:
-            os.remove(ckpt_path)
-        except OSError:
-            pass
-
-        try:
-            from huggingface_hub import snapshot_download
-
-            os.makedirs(local_repo_dir, exist_ok=True)
-            try:
-                snapshot_download(
-                    repo_id=original_model_path,
-                    allow_patterns=[f"{subfolder}/*"],
-                    local_dir=local_repo_dir,
-                    local_dir_use_symlinks=False,
                     resume_download=True,
+                    force_download=force,
                 )
             except TypeError:
-                # Older huggingface_hub versions may not support resume_download and/or local_dir.
+                # Older huggingface_hub versions don't support some of these kwargs.
                 try:
                     snapshot_download(
                         repo_id=original_model_path,
@@ -191,6 +149,49 @@ def smart_load_model(
                         repo_id=original_model_path,
                         allow_patterns=[f"{subfolder}/*"],
                     )
+        except ImportError:
+            logger.warning(
+                "You need to install HuggingFace Hub to load models from the hub."
+            )
+            raise RuntimeError(f"Model path {model_path} not found")
+
+    if not os.path.exists(model_path):
+        logger.info('Model path not exists, try to download from huggingface')
+        try:
+            _download_subfolder(force=False)
+
+            model_path = os.path.join(local_repo_dir, subfolder)
+        except Exception as e:
+            raise e
+
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model path {original_model_path} not found")
+
+    extension = 'ckpt' if not use_safetensors else 'safetensors'
+    variant = '' if variant is None else f'.{variant}'
+    ckpt_name = f'model{variant}.{extension}'
+    config_path = os.path.join(model_path, 'config.yaml')
+    ckpt_path = os.path.join(model_path, ckpt_name)
+
+    if force_redownload:
+        logger.warning(f"Force re-download: {original_model_path}/{subfolder}")
+        try:
+            _download_subfolder(force=True)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to re-download {original_model_path}/{subfolder}: {e}"
+            )
+
+    # If a checkpoint exists but is corrupt (common with large files), delete and re-download.
+    if use_safetensors and os.path.exists(ckpt_path) and not _is_valid_safetensors_file(ckpt_path):
+        logger.warning(f"Corrupted checkpoint detected: {ckpt_path}. Will re-download {original_model_path}/{subfolder}.")
+        try:
+            os.remove(ckpt_path)
+        except OSError:
+            pass
+
+        try:
+            _download_subfolder(force=True)
         except Exception as e:
             raise RuntimeError(
                 f"Failed to re-download corrupted checkpoint {ckpt_path} from {original_model_path}/{subfolder}: {e}"

@@ -131,14 +131,36 @@ class VectsetVAE(nn.Module):
             variant=variant
         )
 
-        return cls.from_single_file(
-            ckpt_path,
-            config_path,
-            device=device,
-            dtype=dtype,
-            use_safetensors=use_safetensors,
-            **kwargs
-        )
+        try:
+            return cls.from_single_file(
+                ckpt_path,
+                config_path,
+                device=device,
+                dtype=dtype,
+                use_safetensors=use_safetensors,
+                **kwargs
+            )
+        except Exception as e:
+            if use_safetensors:
+                logger.warning(
+                    f"VAE load failed from cache, re-downloading and retrying once: {model_path}/{subfolder}. Error: {e}"
+                )
+                config_path, ckpt_path = smart_load_model(
+                    model_path,
+                    subfolder=subfolder,
+                    use_safetensors=use_safetensors,
+                    variant=variant,
+                    force_redownload=True,
+                )
+                return cls.from_single_file(
+                    ckpt_path,
+                    config_path,
+                    device=device,
+                    dtype=dtype,
+                    use_safetensors=use_safetensors,
+                    **kwargs
+                )
+            raise
 
     def init_from_ckpt(self, path, ignore_keys=()):
         state_dict = torch.load(path, map_location="cpu")
