@@ -68,12 +68,7 @@ MSYS_NO_PATHCONV=1 docker run  --name hunyuan3d-2 --gpus all -d \
   hunyuan3d-2:test
 ```
 
-```
-docker run --gpus all -d -p 7860:7860 \
-  -v $(pwd)/cache:/workspace/cache \
-  -v $(pwd)/outputs:/workspace/outputs \
-  hunyuan3d-2:test
-```
+
 
 Open:
 

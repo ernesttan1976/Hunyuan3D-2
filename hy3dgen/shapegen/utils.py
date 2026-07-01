@@ -35,6 +35,24 @@ def get_logger(name):
 logger = get_logger('hy3dgen.shapgen')
 
 
+def _is_valid_safetensors_file(path: str) -> bool:
+    # safetensors errors like "incomplete metadata, file not fully covered" typically
+    # indicate a truncated/corrupt file (often from an interrupted download/copy).
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return False
+        from safetensors import safe_open
+
+        with safe_open(path, framework="pt", device="cpu") as f:
+            _ = f.metadata()
+            # Force header parsing.
+            _ = list(f.keys())
+        return True
+    except Exception as e:
+        logger.warning(f"Invalid safetensors file at {path}: {e}")
+        return False
+
+
 class synchronize_timer:
     """ Synchronized timer to count the inference time of `nn.Module.forward`.
 
@@ -138,4 +156,50 @@ def smart_load_model(
     ckpt_name = f'model{variant}.{extension}'
     config_path = os.path.join(model_path, 'config.yaml')
     ckpt_path = os.path.join(model_path, ckpt_name)
+
+    # If a checkpoint exists but is corrupt (common with large files), delete and re-download.
+    if use_safetensors and os.path.exists(ckpt_path) and not _is_valid_safetensors_file(ckpt_path):
+        logger.warning(f"Corrupted checkpoint detected: {ckpt_path}. Will re-download {original_model_path}/{subfolder}.")
+        try:
+            os.remove(ckpt_path)
+        except OSError:
+            pass
+
+        try:
+            from huggingface_hub import snapshot_download
+
+            os.makedirs(local_repo_dir, exist_ok=True)
+            try:
+                snapshot_download(
+                    repo_id=original_model_path,
+                    allow_patterns=[f"{subfolder}/*"],
+                    local_dir=local_repo_dir,
+                    local_dir_use_symlinks=False,
+                    resume_download=True,
+                )
+            except TypeError:
+                # Older huggingface_hub versions may not support resume_download and/or local_dir.
+                try:
+                    snapshot_download(
+                        repo_id=original_model_path,
+                        allow_patterns=[f"{subfolder}/*"],
+                        local_dir=local_repo_dir,
+                        local_dir_use_symlinks=False,
+                    )
+                except TypeError:
+                    snapshot_download(
+                        repo_id=original_model_path,
+                        allow_patterns=[f"{subfolder}/*"],
+                    )
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to re-download corrupted checkpoint {ckpt_path} from {original_model_path}/{subfolder}: {e}"
+            )
+
+        if not _is_valid_safetensors_file(ckpt_path):
+            raise RuntimeError(
+                f"Checkpoint still invalid after re-download: {ckpt_path}. "
+                "Delete the cache folder and retry."
+            )
+
     return config_path, ckpt_path

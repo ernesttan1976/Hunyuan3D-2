@@ -1015,6 +1015,27 @@ if __name__ == '__main__':
                 "huggingface_hub is required for --prefetch_models (it should come with diffusers/transformers)."
             ) from e
 
+        def _validate_safetensors_dir(dir_path: Path) -> None:
+            # Fail fast if we ended up with a truncated/corrupt safetensors.
+            try:
+                from safetensors import safe_open
+            except Exception:
+                # safetensors is part of runtime deps; if missing here, skip validation.
+                return
+
+            if not dir_path.exists():
+                return
+
+            for p in sorted(dir_path.rglob('*.safetensors')):
+                try:
+                    if p.stat().st_size <= 0:
+                        raise RuntimeError('empty file')
+                    with safe_open(str(p), framework='pt', device='cpu') as f:
+                        _ = f.metadata()
+                        _ = list(f.keys())
+                except Exception as e:
+                    raise RuntimeError(f"Invalid safetensors under {dir_path}: {p} ({e})")
+
         hy3dgen_models = Path(os.environ.get('HY3DGEN_MODELS', 'cache/hy3dgen')).expanduser().absolute()
         hy3dgen_models.mkdir(parents=True, exist_ok=True)
 
@@ -1027,10 +1048,19 @@ if __name__ == '__main__':
                     allow_patterns=allow_patterns,
                     local_dir=str(local_dir),
                     local_dir_use_symlinks=False,
+                    resume_download=True,
                 )
             except TypeError:
-                # Older huggingface_hub versions don't support local_dir/local_dir_use_symlinks.
-                snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns)
+                # Older huggingface_hub versions may not support resume_download and/or local_dir.
+                try:
+                    snapshot_download(
+                        repo_id=repo_id,
+                        allow_patterns=allow_patterns,
+                        local_dir=str(local_dir),
+                        local_dir_use_symlinks=False,
+                    )
+                except TypeError:
+                    snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns)
 
         # ShapeGen (DiT) weights live under HY3DGEN_MODELS/<repo_id>/<subfolder>/...
         _snap(
@@ -1038,6 +1068,8 @@ if __name__ == '__main__':
             [f"{args.subfolder}/*"],
             hy3dgen_models / args.model_path,
         )
+
+        _validate_safetensors_dir(hy3dgen_models / args.model_path / args.subfolder)
 
         # FlashVDM replaces the VAE with a separately-shipped VAE checkpoint.
         if args.enable_flashvdm:
@@ -1050,6 +1082,7 @@ if __name__ == '__main__':
             if model_name in turbo_vae_mapping:
                 vae_repo, vae_subfolder = turbo_vae_mapping[model_name]
                 _snap(vae_repo, [f"{vae_subfolder}/*"], hy3dgen_models / vae_repo)
+                _validate_safetensors_dir(hy3dgen_models / vae_repo / vae_subfolder)
 
         # TexGen (Hunyuan3D-2 paint + delight) weights also live under HY3DGEN_MODELS.
         if not args.disable_tex:
@@ -1061,6 +1094,9 @@ if __name__ == '__main__':
                 ],
                 hy3dgen_models / args.texgen_model_path,
             )
+
+            _validate_safetensors_dir(hy3dgen_models / args.texgen_model_path / 'hunyuan3d-delight-v2-0')
+            _validate_safetensors_dir(hy3dgen_models / args.texgen_model_path / 'hunyuan3d-paint-v2-0-turbo')
 
         # Text-to-image model lives in the HF cache (HF_HOME / HF_HUB_CACHE).
         if args.enable_t23d:
