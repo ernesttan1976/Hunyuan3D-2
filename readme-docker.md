@@ -51,7 +51,7 @@ This repo already contains `Dockerfile` (and a `.dockerignore`).
 docker build -t hunyuan3d-2 /d/Hunyuan3D-2
 ```
 
- DOCKER_BUILDKIT=1 docker build -t hunyuan3d-2 .
+ DOCKER_BUILDKIT=1 docker build -t hunyuan3d-2 .  
 
 ---
 

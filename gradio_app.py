@@ -18,6 +18,8 @@ import shutil
 import time
 import gc
 import threading
+import json
+import struct
 from glob import glob
 from pathlib import Path
 
@@ -309,7 +311,9 @@ def gen_save_folder(max_size=200):
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     # 获取所有文件夹路径
-    dirs = [f for f in Path(SAVE_DIR).iterdir() if f.is_dir()]
+    # Never delete reserved static assets (served by model-viewer templates).
+    reserved = {"env_maps"}
+    dirs = [f for f in Path(SAVE_DIR).iterdir() if f.is_dir() and f.name not in reserved]
 
     # 如果文件夹数量超过 max_size，删除创建时间最久的文件夹
     if len(dirs) >= max_size:
@@ -361,10 +365,13 @@ def build_model_viewer_html(save_folder, height=660, width=790, textured=False):
     with open(output_html_path, 'w', encoding='utf-8') as f:
         template_html = template_html.replace('#height#', f'{height - offset}')
         template_html = template_html.replace('#width#', f'{width}')
-        template_html = template_html.replace('#src#', f'{related_path}/')
+        # model-viewer expects a file URL; do not append a trailing slash.
+        template_html = template_html.replace('#src#', f'{related_path}')
         f.write(template_html)
 
     rel_path = os.path.relpath(output_html_path, SAVE_DIR)
+    # Use URL separators even on Windows.
+    rel_path = rel_path.replace('\\', '/')
     iframe_tag = f'<iframe src="/static/{rel_path}" height="{height}" width="100%" frameborder="0"></iframe>'
     print(
         f'Find html file {output_html_path}, {os.path.exists(output_html_path)}, relative HTML path is /static/{rel_path}')
@@ -431,10 +438,25 @@ def _gen_shape(
     }
     time_meta = {}
 
+    def _save_input_png(pil_img) -> None:
+        # Best-effort: sessions should still succeed even if disk write fails.
+        try:
+            if pil_img is None:
+                return
+            out_path = os.path.join(save_folder, 'input.png')
+            # Preserve transparency if present.
+            pil_img.save(out_path)
+        except Exception as e:
+            print(f"Failed to save input.png: {e}")
+
     if image is None:
         start_time = time.time()
         image = get_t2i_worker()(caption)
         time_meta['text2image'] = time.time() - start_time
+
+    # Persist the original input image for session browsing/replay.
+    if not MV_MODE:
+        _save_input_png(image)
 
     # remove disk io to make responding faster, uncomment at your will.
     # image.save(os.path.join(save_folder, 'input.png'))
@@ -747,6 +769,12 @@ def build_app():
                                         inputs=[mv_image_front, mv_image_back, mv_image_left, mv_image_right],
                                         label=None, examples_per_page=6)
 
+                    with gr.Tab('Sessions', id='tab_sessions'):
+                        with gr.Row():
+                            refresh_sessions = gr.Button(value='Refresh', min_width=100)
+                        sessions_dropdown = gr.Dropdown(label='Past Sessions', choices=[], value=None)
+                        session_input_preview = gr.Image(label='Saved Input (input.png)', type='filepath', height=290)
+
         gr.HTML(f"""
         <div align="center">
         Activated Model - Shape Generation ({args.model_path}/{args.subfolder}) ; Texture Generation ({'Hunyuan3D-2' if HAS_TEXTUREGEN else 'Unavailable'})
@@ -848,8 +876,12 @@ def build_app():
 
         def on_export_click(file_out, file_out2, file_type, reduce_face, export_texture, target_face_num):
             with _ActiveCall():
-                if file_out is None:
-                    raise gr.Error('Please generate a mesh first.')
+                if export_texture:
+                    if file_out2 is None:
+                        raise gr.Error('Please generate/load a textured mesh first.')
+                else:
+                    if file_out is None:
+                        raise gr.Error('Please generate/load a mesh first.')
 
                 print(f'exporting {file_out}')
                 print(f'reduce face to {target_face_num}')
@@ -895,6 +927,274 @@ def build_app():
             on_export_click,
             inputs=[file_out, file_out2, file_type, reduce_face, export_texture, target_face_num],
             outputs=[html_export_mesh, file_export]
+        )
+
+        # -----------------
+        # Sessions Browser
+        # -----------------
+
+        def _read_textured_stats_from_glb(glb_path: str) -> dict:
+            """Read embedded stats from textured_mesh.glb without importing trimesh."""
+            try:
+                b = Path(glb_path).read_bytes()
+                # GLB header: magic(4) version(4) length(4)
+                if len(b) < 20:
+                    return {}
+                magic, _version, _length = struct.unpack_from('<4sII', b, 0)
+                if magic != b'glTF':
+                    return {}
+                chunk_len, chunk_type = struct.unpack_from('<I4s', b, 12)
+                if chunk_type != b'JSON':
+                    return {}
+                j = json.loads(b[20:20 + chunk_len].decode('utf-8'))
+                # Known layout from current exporter: meshes[0].extras.extras
+                ex = (j.get('meshes') or [{}])[0].get('extras')
+                if isinstance(ex, dict) and isinstance(ex.get('extras'), dict):
+                    ex = ex.get('extras')
+                if isinstance(ex, dict) and 'params' in ex and 'time' in ex:
+                    return ex
+            except Exception:
+                return {}
+            return {}
+
+        def _list_sessions() -> tuple[list[tuple[str, str]], str | None]:
+            root = Path(SAVE_DIR)
+            if not root.exists():
+                return [], None
+
+            items: list[tuple[float, str, str]] = []
+            for d in root.iterdir():
+                if not d.is_dir() or d.name == 'env_maps':
+                    continue
+                textured = d / 'textured_mesh.glb'
+                white = d / 'white_mesh.glb'
+                if not textured.is_file() and not white.is_file():
+                    continue
+
+                mtime = d.stat().st_mtime
+                seed = None
+                steps = None
+                if textured.is_file():
+                    st = _read_textured_stats_from_glb(str(textured))
+                    params = st.get('params') if isinstance(st, dict) else None
+                    if isinstance(params, dict):
+                        seed = params.get('seed')
+                        steps = params.get('steps')
+
+                ts = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(mtime))
+                short = d.name.split('-')[0]
+                label = f"{ts} | {short}"
+                if seed is not None:
+                    label += f" | seed={seed}"
+                if steps is not None:
+                    label += f" | steps={steps}"
+                items.append((mtime, label, d.name))
+
+            items.sort(key=lambda t: t[0], reverse=True)
+            choices = [(label, session_id) for _mtime, label, session_id in items]
+            default_val = choices[0][1] if choices else None
+            return choices, default_val
+
+        def _load_session(session_id: str):
+            if not session_id:
+                return (
+                    gr.update(value=None),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    HTML_OUTPUT_PLACEHOLDER,
+                    HTML_OUTPUT_PLACEHOLDER,
+                    {},
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(),
+                    gr.update(selected='gen_mesh_panel'),
+                )
+
+            folder = Path(SAVE_DIR) / session_id
+            input_png = folder / 'input.png'
+            textured_glb = folder / 'textured_mesh.glb'
+            white_glb = folder / 'white_mesh.glb'
+
+            # Prefer textured for preview/export when present.
+            has_textured = textured_glb.is_file()
+            has_white = white_glb.is_file()
+
+            if has_textured:
+                html_path = folder / 'textured_mesh.html'
+                if not html_path.is_file():
+                    _ = build_model_viewer_html(str(folder), height=HTML_HEIGHT, width=HTML_WIDTH, textured=True)
+                viewer_html = build_model_viewer_html(str(folder), height=HTML_HEIGHT, width=HTML_WIDTH, textured=True)
+                file_out_val = str(white_glb) if has_white else str(textured_glb)
+                file_out2_val = str(textured_glb)
+                st = _read_textured_stats_from_glb(str(textured_glb))
+            elif has_white:
+                html_path = folder / 'white_mesh.html'
+                if not html_path.is_file():
+                    _ = build_model_viewer_html(str(folder), height=HTML_HEIGHT, width=HTML_WIDTH, textured=False)
+                viewer_html = build_model_viewer_html(str(folder), height=HTML_HEIGHT, width=HTML_WIDTH, textured=False)
+                file_out_val = str(white_glb)
+                file_out2_val = None
+                st = {}
+            else:
+                viewer_html = HTML_OUTPUT_PLACEHOLDER
+                file_out_val = None
+                file_out2_val = None
+                st = {}
+
+            params = st.get('params') if isinstance(st, dict) else None
+            if not isinstance(params, dict):
+                params = {}
+
+            seed_val = params.get('seed')
+            caption_val = params.get('caption')
+
+            # Restore controls for reproducibility; keep randomize_seed off.
+            steps_val = params.get('steps')
+            cfg_val = params.get('guidance_scale')
+            oct_val = params.get('octree_resolution')
+            rembg_val = params.get('check_box_rembg')
+            chunks_val = params.get('num_chunks')
+
+            # Input image: only update if present (older sessions may not have it).
+            if input_png.is_file():
+                img_update = gr.update(value=str(input_png))
+                preview_update = gr.update(value=str(input_png))
+                tab_prompt_update = gr.update(selected='tab_img_prompt')
+            else:
+                img_update = gr.update()
+                preview_update = gr.update(value=None)
+                tab_prompt_update = gr.update()
+
+            # Export UX should match freshly-generated state.
+            if has_textured:
+                export_texture_update = gr.update(visible=True, value=True)
+                reduce_face_update = gr.update(interactive=False)
+            else:
+                export_texture_update = gr.update(visible=False, value=False)
+                reduce_face_update = gr.update(interactive=True)
+
+            return (
+                preview_update,
+                img_update,
+                gr.update(value=file_out_val),
+                gr.update(value=file_out2_val),
+                viewer_html,
+                HTML_OUTPUT_PLACEHOLDER,
+                st,
+                gr.update(value=seed_val) if seed_val is not None else gr.update(),
+                gr.update(value=caption_val) if caption_val is not None else gr.update(),
+                gr.update(value=steps_val) if steps_val is not None else gr.update(),
+                gr.update(value=cfg_val) if cfg_val is not None else gr.update(),
+                gr.update(value=oct_val) if oct_val is not None else gr.update(),
+                gr.update(value=rembg_val) if rembg_val is not None else gr.update(),
+                gr.update(value=chunks_val) if chunks_val is not None else gr.update(),
+                gr.update(value=False),
+                export_texture_update,
+                reduce_face_update,
+                gr.update(interactive=True),
+                gr.update(interactive=False),
+                tab_prompt_update,
+                gr.update(selected='gen_mesh_panel'),
+            )
+
+        def _refresh_sessions():
+            choices, default_val = _list_sessions()
+            return gr.update(choices=choices, value=default_val)
+
+        refresh_sessions.click(_refresh_sessions, outputs=[sessions_dropdown]).then(
+            _load_session,
+            inputs=[sessions_dropdown],
+            outputs=[
+                session_input_preview,
+                image,
+                file_out,
+                file_out2,
+                html_gen_mesh,
+                html_export_mesh,
+                stats,
+                seed,
+                caption,
+                num_steps,
+                cfg_scale,
+                octree_resolution,
+                check_box_rembg,
+                num_chunks,
+                randomize_seed,
+                export_texture,
+                reduce_face,
+                confirm_export,
+                file_export,
+                tabs_prompt,
+                tabs_output,
+            ],
+        )
+
+        sessions_dropdown.change(
+            _load_session,
+            inputs=[sessions_dropdown],
+            outputs=[
+                session_input_preview,
+                image,
+                file_out,
+                file_out2,
+                html_gen_mesh,
+                html_export_mesh,
+                stats,
+                seed,
+                caption,
+                num_steps,
+                cfg_scale,
+                octree_resolution,
+                check_box_rembg,
+                num_chunks,
+                randomize_seed,
+                export_texture,
+                reduce_face,
+                confirm_export,
+                file_export,
+                tabs_prompt,
+                tabs_output,
+            ],
+        )
+
+        # Populate session list once on load (and load most recent).
+        demo.load(_refresh_sessions, outputs=[sessions_dropdown]).then(
+            _load_session,
+            inputs=[sessions_dropdown],
+            outputs=[
+                session_input_preview,
+                image,
+                file_out,
+                file_out2,
+                html_gen_mesh,
+                html_export_mesh,
+                stats,
+                seed,
+                caption,
+                num_steps,
+                cfg_scale,
+                octree_resolution,
+                check_box_rembg,
+                num_chunks,
+                randomize_seed,
+                export_texture,
+                reduce_face,
+                confirm_export,
+                file_export,
+                tabs_prompt,
+                tabs_output,
+            ],
         )
 
     return demo
@@ -954,7 +1254,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', type=str, default='0.0.0.0')
     parser.add_argument('--device', type=str, default='cuda')
     parser.add_argument('--mc_algo', type=str, default='mc')
-    parser.add_argument('--cache-path', type=str, default='gradio_cache')
+    parser.add_argument('--cache-path', type=str, default='outputs')
     parser.add_argument(
         '--model-cache-dir',
         '--model_cache_dir',
@@ -1158,6 +1458,11 @@ if __name__ == '__main__':
 
     _apply_cuda_vram_cap(args.max_vram_gb, args.device)
 
+    # Canonical session root: always use ./outputs for sessions browsing + static serving.
+    # (User requested outputs to be canonical even if --cache-path is specified.)
+    if args.cache_path and args.cache_path != 'outputs':
+        print(f"[sessions] Overriding --cache-path={args.cache_path!r} to canonical 'outputs'.")
+    args.cache_path = 'outputs'
     SAVE_DIR = args.cache_path
     os.makedirs(SAVE_DIR, exist_ok=True)
 
