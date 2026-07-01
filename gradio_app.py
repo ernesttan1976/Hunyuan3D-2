@@ -693,6 +693,7 @@ def build_app():
                                         variant='primary',
                                         visible=HAS_TEXTUREGEN,
                                         min_width=100)
+                    btn_sessions = gr.Button(value='Sessions', min_width=100)
 
                 with gr.Group():
                     file_out = gr.File(label="File", visible=False)
@@ -754,6 +755,13 @@ def build_app():
 
             with gr.Column(scale=3 if MV_MODE else 2):
                 with gr.Tabs(selected='tab_img_gallery') as gallery:
+                    # Put Sessions first so it doesn't get hidden behind tab overflow on narrow screens.
+                    with gr.Tab('Sessions', id='tab_sessions'):
+                        with gr.Row():
+                            refresh_sessions = gr.Button(value='Refresh', min_width=100)
+                        sessions_dropdown = gr.Dropdown(label='Past Sessions', choices=[], value=None)
+                        session_input_preview = gr.Image(label='Saved Input (input.png)', type='filepath', height=290)
+
                     with gr.Tab('Image to 3D Gallery', id='tab_img_gallery', visible=not MV_MODE) as tab_gi:
                         with gr.Row():
                             gr.Examples(examples=example_is, inputs=[image],
@@ -769,11 +777,7 @@ def build_app():
                                         inputs=[mv_image_front, mv_image_back, mv_image_left, mv_image_right],
                                         label=None, examples_per_page=6)
 
-                    with gr.Tab('Sessions', id='tab_sessions'):
-                        with gr.Row():
-                            refresh_sessions = gr.Button(value='Refresh', min_width=100)
-                        sessions_dropdown = gr.Dropdown(label='Past Sessions', choices=[], value=None)
-                        session_input_preview = gr.Image(label='Saved Input (input.png)', type='filepath', height=290)
+        btn_sessions.click(fn=lambda: gr.update(selected='tab_sessions'), outputs=[gallery])
 
         gr.HTML(f"""
         <div align="center">
