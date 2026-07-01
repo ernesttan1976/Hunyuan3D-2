@@ -5,7 +5,6 @@ __pycache__/
 **/*.pyc
 
 # Local run artifacts (keep out of build context)
-cache/
 models/
 outputs/
 gradio_cache/

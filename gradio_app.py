@@ -39,6 +39,7 @@ MAX_SEED = int(1e7)
 _WORKER_LOCK = threading.RLock()
 _LAST_USE_TS = 0.0
 _ACTIVE_CALLS = 0
+_LOADING_MODELS = 0
 
 i23d_worker = None
 rmbg_worker = None
@@ -76,6 +77,22 @@ class _ActiveCall:
         global _ACTIVE_CALLS
         with _WORKER_LOCK:
             _ACTIVE_CALLS = max(0, _ACTIVE_CALLS - 1)
+            _touch_last_use()
+
+
+class _ModelLoading:
+    """Marks model initialization as "active" so idle-unload doesn't race model load."""
+
+    def __enter__(self):
+        global _LOADING_MODELS
+        with _WORKER_LOCK:
+            _LOADING_MODELS += 1
+            _touch_last_use()
+
+    def __exit__(self, exc_type, exc, tb):
+        global _LOADING_MODELS
+        with _WORKER_LOCK:
+            _LOADING_MODELS = max(0, _LOADING_MODELS - 1)
             _touch_last_use()
 
 
@@ -169,7 +186,8 @@ def get_rmbg_worker():
         _touch_last_use()
         if rmbg_worker is None:
             _lazy_import_rembg()
-            rmbg_worker = BackgroundRemover()
+            with _ModelLoading():
+                rmbg_worker = BackgroundRemover()
         return rmbg_worker
 
 
@@ -179,17 +197,18 @@ def get_i23d_worker():
         _touch_last_use()
         if i23d_worker is None:
             _lazy_import_shapegen()
-            i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
-                args.model_path,
-                subfolder=args.subfolder,
-                use_safetensors=True,
-                device=args.device,
-            )
-            if args.enable_flashvdm:
-                mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
-                i23d_worker.enable_flashvdm(mc_algo=mc_algo)
-            if args.compile:
-                i23d_worker.compile()
+            with _ModelLoading():
+                i23d_worker = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
+                    args.model_path,
+                    subfolder=args.subfolder,
+                    use_safetensors=True,
+                    device=args.device,
+                )
+                if args.enable_flashvdm:
+                    mc_algo = 'mc' if args.device in ['cpu', 'mps'] else args.mc_algo
+                    i23d_worker.enable_flashvdm(mc_algo=mc_algo)
+                if args.compile:
+                    i23d_worker.compile()
         return i23d_worker
 
 
@@ -199,7 +218,8 @@ def get_floater_remove_worker():
         _touch_last_use()
         if floater_remove_worker is None:
             _lazy_import_shapegen()
-            floater_remove_worker = FloaterRemover()
+            with _ModelLoading():
+                floater_remove_worker = FloaterRemover()
         return floater_remove_worker
 
 
@@ -209,7 +229,8 @@ def get_degenerate_face_remove_worker():
         _touch_last_use()
         if degenerate_face_remove_worker is None:
             _lazy_import_shapegen()
-            degenerate_face_remove_worker = DegenerateFaceRemover()
+            with _ModelLoading():
+                degenerate_face_remove_worker = DegenerateFaceRemover()
         return degenerate_face_remove_worker
 
 
@@ -219,7 +240,8 @@ def get_face_reduce_worker():
         _touch_last_use()
         if face_reduce_worker is None:
             _lazy_import_shapegen()
-            face_reduce_worker = FaceReducer()
+            with _ModelLoading():
+                face_reduce_worker = FaceReducer()
         return face_reduce_worker
 
 
@@ -231,9 +253,10 @@ def get_texgen_worker():
         _touch_last_use()
         if texgen_worker is None:
             _lazy_import_texgen()
-            texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
-            if args.low_vram_mode:
-                texgen_worker.enable_model_cpu_offload()
+            with _ModelLoading():
+                texgen_worker = Hunyuan3DPaintPipeline.from_pretrained(args.texgen_model_path)
+                if args.low_vram_mode:
+                    texgen_worker.enable_model_cpu_offload()
         return texgen_worker
 
 
@@ -245,10 +268,11 @@ def get_t2i_worker():
         _touch_last_use()
         if t2i_worker is None:
             _lazy_import_t2i()
-            t2i_worker = HunyuanDiTPipeline(
-                'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
-                device=args.device,
-            )
+            with _ModelLoading():
+                t2i_worker = HunyuanDiTPipeline(
+                    'Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled',
+                    device=args.device,
+                )
         return t2i_worker
 
 
@@ -945,6 +969,11 @@ if __name__ == '__main__':
     parser.add_argument('--compile', action='store_true')
     parser.add_argument('--low_vram_mode', action='store_true')
     parser.add_argument(
+        '--prefetch_models',
+        action='store_true',
+        help='Download/mirror model files into --model-cache-dir and exit (for faster startup and Docker builds).',
+    )
+    parser.add_argument(
         '--lazy_load_models',
         action='store_true',
         help='Defer loading large models until first use (slower first request, lower startup RAM/VRAM).',
@@ -975,6 +1004,82 @@ if __name__ == '__main__':
         os.environ.setdefault('U2NET_HOME', str(root / 'u2net'))
 
     _configure_model_caches(args.model_cache_dir)
+
+    def _prefetch_models() -> None:
+        from pathlib import Path
+
+        try:
+            from huggingface_hub import snapshot_download
+        except Exception as e:
+            raise RuntimeError(
+                "huggingface_hub is required for --prefetch_models (it should come with diffusers/transformers)."
+            ) from e
+
+        hy3dgen_models = Path(os.environ.get('HY3DGEN_MODELS', 'cache/hy3dgen')).expanduser().absolute()
+        hy3dgen_models.mkdir(parents=True, exist_ok=True)
+
+        def _snap(repo_id: str, allow_patterns: list[str], local_dir: Path) -> None:
+            local_dir.mkdir(parents=True, exist_ok=True)
+            print(f"[prefetch] repo={repo_id} -> {local_dir}")
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    allow_patterns=allow_patterns,
+                    local_dir=str(local_dir),
+                    local_dir_use_symlinks=False,
+                )
+            except TypeError:
+                # Older huggingface_hub versions don't support local_dir/local_dir_use_symlinks.
+                snapshot_download(repo_id=repo_id, allow_patterns=allow_patterns)
+
+        # ShapeGen (DiT) weights live under HY3DGEN_MODELS/<repo_id>/<subfolder>/...
+        _snap(
+            args.model_path,
+            [f"{args.subfolder}/*"],
+            hy3dgen_models / args.model_path,
+        )
+
+        # FlashVDM replaces the VAE with a separately-shipped VAE checkpoint.
+        if args.enable_flashvdm:
+            model_name = str(args.model_path).split('/')[-1]
+            turbo_vae_mapping = {
+                'Hunyuan3D-2': ('tencent/Hunyuan3D-2', 'hunyuan3d-vae-v2-0-turbo'),
+                'Hunyuan3D-2mv': ('tencent/Hunyuan3D-2', 'hunyuan3d-vae-v2-0-turbo'),
+                'Hunyuan3D-2mini': ('tencent/Hunyuan3D-2mini', 'hunyuan3d-vae-v2-mini-turbo'),
+            }
+            if model_name in turbo_vae_mapping:
+                vae_repo, vae_subfolder = turbo_vae_mapping[model_name]
+                _snap(vae_repo, [f"{vae_subfolder}/*"], hy3dgen_models / vae_repo)
+
+        # TexGen (Hunyuan3D-2 paint + delight) weights also live under HY3DGEN_MODELS.
+        if not args.disable_tex:
+            _snap(
+                args.texgen_model_path,
+                [
+                    "hunyuan3d-delight-v2-0/*",
+                    "hunyuan3d-paint-v2-0-turbo/*",
+                ],
+                hy3dgen_models / args.texgen_model_path,
+            )
+
+        # Text-to-image model lives in the HF cache (HF_HOME / HF_HUB_CACHE).
+        if args.enable_t23d:
+            print("[prefetch] repo=Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled -> HF cache")
+            snapshot_download(repo_id='Tencent-Hunyuan/HunyuanDiT-v1.1-Diffusers-Distilled')
+
+        # rembg u2net weights (honors U2NET_HOME).
+        try:
+            _lazy_import_rembg()
+            with _ModelLoading():
+                _ = BackgroundRemover()
+        except Exception as e:
+            print(f"[prefetch] rembg prefetch failed (will retry at runtime): {e}")
+
+        print("[prefetch] done")
+
+    if args.prefetch_models:
+        _prefetch_models()
+        raise SystemExit(0)
 
     if args.max_vram_gb is None:
         _env_max_vram = os.getenv('HY3D_MAX_VRAM_GB')
@@ -1099,7 +1204,8 @@ if __name__ == '__main__':
                         )
                     )
                     active = _ACTIVE_CALLS
-                if any_loaded and active == 0 and idle_for >= args.idle_unload_sec:
+                    loading = _LOADING_MODELS
+                if any_loaded and active == 0 and loading == 0 and idle_for >= args.idle_unload_sec:
                     unload_models(reason=f"idle_for={idle_for:.0f}s")
 
         threading.Thread(target=_idle_unload_loop, daemon=True).start()
