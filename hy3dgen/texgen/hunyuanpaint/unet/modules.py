@@ -428,7 +428,21 @@ class UNet2p5DConditionModel(torch.nn.Module):
             config = json.load(file)
         unet = UNet2DConditionModel(**config)
         unet = UNet2p5DConditionModel(unet)
-        unet_ckpt = torch.load(unet_ckpt_path, map_location='cpu', weights_only=True)
+        try:
+            unet_ckpt = torch.load(unet_ckpt_path, map_location='cpu', weights_only=True)
+        except Exception as e:
+            size = None
+            try:
+                size = os.path.getsize(unet_ckpt_path)
+            except Exception:
+                pass
+
+            raise RuntimeError(
+                "Failed to load UNet checkpoint (likely a truncated/corrupted download). "
+                f"path={unet_ckpt_path!r} size_bytes={size}. "
+                "If you are using a local HY3DGEN_MODELS cache, delete this file (or the whole model folder) and re-download. "
+                "If you are running gradio_app.py, re-run with --prefetch_models to re-fetch weights."
+            ) from e
         unet.load_state_dict(unet_ckpt, strict=True)
         unet = unet.to(torch_dtype)
         return unet

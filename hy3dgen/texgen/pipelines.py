@@ -17,6 +17,7 @@ import logging
 import numpy as np
 import os
 import torch
+import zipfile
 from PIL import Image
 from typing import List, Union, Optional
 
@@ -28,6 +29,23 @@ from .utils.imagesuper_utils import Image_Super_Net
 from .utils.uv_warp_utils import mesh_uv_wrap
 
 logger = logging.getLogger(__name__)
+
+
+def _looks_like_valid_torch_zip(path: str) -> bool:
+    """Cheap corruption check for torch-saved .bin files.
+
+    The common failure we see is a truncated download where torch.load errors with:
+    "PytorchStreamReader failed reading zip archive: failed finding central directory".
+    """
+    try:
+        if not os.path.exists(path) or os.path.getsize(path) <= 0:
+            return False
+        # Opening a ZipFile reads the central directory; a truncated file fails here.
+        with zipfile.ZipFile(path, "r") as zf:
+            _ = zf.namelist()
+        return True
+    except Exception:
+        return False
 
 
 class Hunyuan3DTexGenConfig:
@@ -64,7 +82,12 @@ class Hunyuan3DPaintPipeline:
             delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
             multiview_model_path = os.path.join(model_path, subfolder)
 
-            if not os.path.exists(delight_model_path) or not os.path.exists(multiview_model_path):
+            # Detect the most common bad-cache scenario early: truncated UNet weights.
+            unet_bin = os.path.join(multiview_model_path, 'unet', 'diffusion_pytorch_model.bin')
+            has_models = os.path.exists(delight_model_path) and os.path.exists(multiview_model_path)
+            has_corrupt_unet = has_models and (os.path.exists(unet_bin) and not _looks_like_valid_torch_zip(unet_bin))
+
+            if (not has_models) or has_corrupt_unet:
                 try:
                     from huggingface_hub import snapshot_download
 
@@ -73,18 +96,37 @@ class Hunyuan3DPaintPipeline:
                         "hunyuan3d-delight-v2-0/*",
                         f"{subfolder}/*",
                     ]
+
+                    if has_corrupt_unet:
+                        try:
+                            os.remove(unet_bin)
+                        except Exception:
+                            pass
+
                     try:
                         snapshot_download(
                             repo_id=original_model_path,
                             allow_patterns=allow_patterns,
                             local_dir=local_repo_dir,
                             local_dir_use_symlinks=False,
+                            resume_download=True,
+                            force_download=True,
                         )
                     except TypeError:
-                        snapshot_download(
-                            repo_id=original_model_path,
-                            allow_patterns=allow_patterns,
-                        )
+                        # Older huggingface_hub versions may not support resume_download/force_download/local_dir.
+                        try:
+                            snapshot_download(
+                                repo_id=original_model_path,
+                                allow_patterns=allow_patterns,
+                                local_dir=local_repo_dir,
+                                local_dir_use_symlinks=False,
+                                resume_download=True,
+                            )
+                        except TypeError:
+                            snapshot_download(
+                                repo_id=original_model_path,
+                                allow_patterns=allow_patterns,
+                            )
 
                     delight_model_path = os.path.join(local_repo_dir, 'hunyuan3d-delight-v2-0')
                     multiview_model_path = os.path.join(local_repo_dir, subfolder)
@@ -98,8 +140,23 @@ class Hunyuan3DPaintPipeline:
         else:
             delight_model_path = os.path.join(model_path, 'hunyuan3d-delight-v2-0')
             multiview_model_path = os.path.join(model_path, subfolder)
+
+            # If the user passes an existing local path, diffusers will not re-download.
+            # Catch the most common failure early and provide a clear remediation.
+            unet_bin = os.path.join(multiview_model_path, 'unet', 'diffusion_pytorch_model.bin')
+            if os.path.exists(unet_bin) and not _looks_like_valid_torch_zip(unet_bin):
+                size = None
+                try:
+                    size = os.path.getsize(unet_bin)
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    "Detected a corrupted UNet checkpoint (likely a truncated download). "
+                    f"path={unet_bin!r} size_bytes={size}. "
+                    "Delete this file (or the whole model folder) and re-download the texture model weights."
+                )
             return cls(Hunyuan3DTexGenConfig(delight_model_path, multiview_model_path, subfolder))
-            
+             
     def __init__(self, config):
         self.config = config
         self.models = {}
