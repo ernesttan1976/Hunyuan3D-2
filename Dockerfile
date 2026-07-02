@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 FROM nvidia/cuda:12.4.1-cudnn-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -92,10 +91,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 RUN --mount=type=cache,target=/root/.cache/pip \
     python -m pip install --no-build-isolation ./hy3dgen/texgen/custom_rasterizer
 
-# Copy mirrored model cache from the repo into the runtime cache location.
-# Populate this folder by running:
-#   python gradio_app.py --prefetch_models --model-cache-dir cache
-COPY cache/ /workspace/cache/
+RUN mkdir -p /workspace/cache /workspace/outputs
 
 EXPOSE 7860
 

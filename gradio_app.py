@@ -43,6 +43,12 @@ _LAST_USE_TS = 0.0
 _ACTIVE_CALLS = 0
 _LOADING_MODELS = 0
 
+# Timing/state metadata for frontend status.
+_LOADING_SINCE = None  # monotonic seconds
+_LAST_LOADING_SEC = None
+_STOPPING_MODELS = 0
+_STOPPING_SINCE = None
+
 i23d_worker = None
 rmbg_worker = None
 texgen_worker = None
@@ -87,15 +93,42 @@ class _ModelLoading:
 
     def __enter__(self):
         global _LOADING_MODELS
+        global _LOADING_SINCE
         with _WORKER_LOCK:
+            if _LOADING_MODELS == 0 and _LOADING_SINCE is None:
+                _LOADING_SINCE = time.monotonic()
             _LOADING_MODELS += 1
             _touch_last_use()
 
     def __exit__(self, exc_type, exc, tb):
         global _LOADING_MODELS
+        global _LOADING_SINCE, _LAST_LOADING_SEC
         with _WORKER_LOCK:
             _LOADING_MODELS = max(0, _LOADING_MODELS - 1)
+            if _LOADING_MODELS == 0 and _LOADING_SINCE is not None:
+                try:
+                    _LAST_LOADING_SEC = max(0.0, time.monotonic() - _LOADING_SINCE)
+                finally:
+                    _LOADING_SINCE = None
             _touch_last_use()
+
+
+class _ModelStopping:
+    """Marks model shutdown/unload as "active" so status can reflect stopping."""
+
+    def __enter__(self):
+        global _STOPPING_MODELS, _STOPPING_SINCE
+        with _WORKER_LOCK:
+            if _STOPPING_MODELS == 0 and _STOPPING_SINCE is None:
+                _STOPPING_SINCE = time.monotonic()
+            _STOPPING_MODELS += 1
+
+    def __exit__(self, exc_type, exc, tb):
+        global _STOPPING_MODELS, _STOPPING_SINCE
+        with _WORKER_LOCK:
+            _STOPPING_MODELS = max(0, _STOPPING_MODELS - 1)
+            if _STOPPING_MODELS == 0:
+                _STOPPING_SINCE = None
 
 
 def _lazy_import_shapegen() -> None:
@@ -149,32 +182,127 @@ def unload_models(reason: str = "") -> None:
     global i23d_worker, rmbg_worker, texgen_worker, t2i_worker
     global floater_remove_worker, degenerate_face_remove_worker, face_reduce_worker
 
+    with _ModelStopping():
+        with _WORKER_LOCK:
+            if _ACTIVE_CALLS != 0:
+                return
+
+            i23d_worker = None
+            rmbg_worker = None
+            texgen_worker = None
+            t2i_worker = None
+
+            floater_remove_worker = None
+            degenerate_face_remove_worker = None
+            face_reduce_worker = None
+
+        # Make sure references are gone before collecting.
+        gc.collect()
+
+        # For CUDA, this drops PyTorch's caching allocator blocks back to the driver.
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+        if reason:
+            print(f"[idle-unload] Unloaded models ({reason}).")
+
+
+def _get_model_status_snapshot() -> dict:
+    """Thread-safe snapshot for UI polling and external status endpoint."""
+    now = time.monotonic()
     with _WORKER_LOCK:
-        if _ACTIVE_CALLS != 0:
-            return
+        any_loaded = any(
+            x is not None
+            for x in (
+                i23d_worker,
+                rmbg_worker,
+                texgen_worker,
+                t2i_worker,
+                floater_remove_worker,
+                degenerate_face_remove_worker,
+                face_reduce_worker,
+            )
+        )
 
-        i23d_worker = None
-        rmbg_worker = None
-        texgen_worker = None
-        t2i_worker = None
+        if _STOPPING_MODELS > 0:
+            status = "stopping"
+        elif _LOADING_MODELS > 0:
+            status = "loading"
+        elif any_loaded:
+            status = "loaded"
+        else:
+            status = "not loaded"
 
-        floater_remove_worker = None
-        degenerate_face_remove_worker = None
-        face_reduce_worker = None
+        idle_for_sec = (now - _LAST_USE_TS) if _LAST_USE_TS else 0.0
 
-    # Make sure references are gone before collecting.
-    gc.collect()
-
-    # For CUDA, this drops PyTorch's caching allocator blocks back to the driver.
-    if torch.cuda.is_available():
+        # Always compute a countdown; UI decides how to render when disabled.
+        shutdown_in_sec = None
         try:
-            torch.cuda.empty_cache()
-            torch.cuda.ipc_collect()
+            idle_unload_sec = float(getattr(args, "idle_unload_sec", 0.0) or 0.0)
         except Exception:
-            pass
+            idle_unload_sec = 0.0
+        if idle_unload_sec > 0:
+            shutdown_in_sec = max(0.0, idle_unload_sec - idle_for_sec)
 
-    if reason:
-        print(f"[idle-unload] Unloaded models ({reason}).")
+        loading_for_sec = (now - _LOADING_SINCE) if _LOADING_SINCE else None
+        last_loading_sec = _LAST_LOADING_SEC
+
+        return {
+            "status": status,
+            "idle_for_sec": idle_for_sec,
+            "shutdown_in_sec": shutdown_in_sec,
+            "loading_for_sec": loading_for_sec,
+            "last_loading_sec": last_loading_sec,
+        }
+
+
+def _format_model_status_html(s: dict) -> str:
+    status = (s or {}).get("status") or "not loaded"
+
+    shutdown_in = (s or {}).get("shutdown_in_sec")
+    if shutdown_in is None:
+        shutdown_msg = "Warning: model shutdown in disabled"
+    else:
+        shutdown_msg = f"Warning: model shutdown in {int(round(max(0.0, shutdown_in)))} seconds"
+
+    loading_for = (s or {}).get("loading_for_sec")
+    last_loading = (s or {}).get("last_loading_sec")
+
+    loading_msg = None
+    if status == "loading" and loading_for is not None:
+        loading_msg = f"Warning: model loading takes {int(round(max(0.0, loading_for)))} seconds"
+        if last_loading is not None:
+            loading_msg += f" (estimated ~{int(round(max(0.0, last_loading)))} seconds)"
+    else:
+        if last_loading is not None:
+            loading_msg = f"Warning: model loading takes ~{int(round(max(0.0, last_loading)))} seconds"
+
+    badge_color = {
+        "not loaded": "#6b7280",
+        "loading": "#b45309",
+        "loaded": "#065f46",
+        "stopping": "#b91c1c",
+    }.get(status, "#6b7280")
+
+    parts = [
+        f"<span style='font-weight:600'>Model status:</span> "
+        f"<span style='display:inline-block;padding:2px 8px;border-radius:999px;"
+        f"background:{badge_color};color:white;font-size:12px;line-height:18px'>"
+        f"{status}</span>",
+        f"<span style='color:#b45309;font-weight:600'>{shutdown_msg}</span>",
+    ]
+    if loading_msg:
+        parts.insert(1, f"<span style='color:#b45309;font-weight:600'>{loading_msg}</span>")
+
+    return (
+        "<div style='margin: 6px 0 10px 0; display:flex; gap:12px; flex-wrap:wrap; align-items:center'>"
+        + "".join(parts)
+        + "</div>"
+    )
 
 
 def get_export_to_trimesh():
@@ -663,6 +791,8 @@ def build_app():
 
     with gr.Blocks(theme=gr.themes.Base(), title='Hunyuan-3D-2.0', analytics_enabled=False, css=custom_css) as demo:
         gr.HTML(title_html)
+
+        model_status_html = gr.HTML(_format_model_status_html(_get_model_status_snapshot()))
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -1201,6 +1331,21 @@ def build_app():
             ],
         )
 
+        # Poll backend status every 5 seconds.
+        def _poll_model_status():
+            return _format_model_status_html(_get_model_status_snapshot())
+
+        # Prefer a native periodic load; fall back to Timer if needed.
+        try:
+            demo.load(_poll_model_status, outputs=[model_status_html], every=5)
+        except TypeError:
+            try:
+                t = gr.Timer(5)
+                t.tick(_poll_model_status, outputs=[model_status_html])
+            except Exception:
+                # Last resort: at least populate once.
+                demo.load(_poll_model_status, outputs=[model_status_html])
+
     return demo
 
 
@@ -1462,12 +1607,14 @@ if __name__ == '__main__':
 
     _apply_cuda_vram_cap(args.max_vram_gb, args.device)
 
-    # Canonical session root: always use ./outputs for sessions browsing + static serving.
-    # (User requested outputs to be canonical even if --cache-path is specified.)
-    if args.cache_path and args.cache_path != 'outputs':
-        print(f"[sessions] Overriding --cache-path={args.cache_path!r} to canonical 'outputs'.")
-    args.cache_path = 'outputs'
-    SAVE_DIR = args.cache_path
+    # Sessions root: must be the same directory we mount as a volume in Docker.
+    # Do NOT override --cache-path here; Dockerfile/compose typically passes something like
+    # /workspace/outputs, and the Sessions browser should scan that volume.
+    if not args.cache_path:
+        args.cache_path = 'outputs'
+    # Make it absolute to avoid surprises when the process CWD differs.
+    SAVE_DIR = str(Path(args.cache_path).expanduser().absolute())
+    args.cache_path = SAVE_DIR
     os.makedirs(SAVE_DIR, exist_ok=True)
 
     CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -1558,6 +1705,11 @@ if __name__ == '__main__':
     # https://discuss.huggingface.co/t/how-to-serve-an-html-file/33921/2
     # create a FastAPI app
     app = FastAPI()
+
+    @app.get('/model_status')
+    async def model_status():
+        return _get_model_status_snapshot()
+
     # create a static directory to store the static files
     static_dir = Path(SAVE_DIR).absolute()
     static_dir.mkdir(parents=True, exist_ok=True)
